@@ -33,6 +33,7 @@ type Config struct {
 type ProviderCollection struct {
 	Telegram TelegramProvider `json:"telegram"`
 	Bark     BarkProvider     `json:"bark"`
+	Webhook  WebhookProvider  `json:"webhook"`
 }
 
 type TelegramProvider struct {
@@ -45,6 +46,15 @@ type BarkProvider struct {
 	Enabled   bool   `json:"enabled"`
 	ServerURL string `json:"server_url"`
 	DeviceKey string `json:"device_key"`
+}
+
+type WebhookProvider struct {
+	Enabled      bool   `json:"enabled"`
+	URL          string `json:"url"`
+	Method       string `json:"method"`
+	AuthHeader   string `json:"auth_header"`
+	AuthValue    string `json:"auth_value"`
+	TimeoutMilli int    `json:"timeout_milli"`
 }
 
 type Profile struct {
@@ -96,6 +106,8 @@ func main() {
 		err = cmdTest(os.Args[2:])
 	case "profile":
 		err = cmdProfile(os.Args[2:])
+	case "rule":
+		err = cmdRule(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
 	case "doctor":
@@ -117,13 +129,17 @@ func printUsage() {
 	fmt.Printf(`knock - agent notification CLI
 
 Usage:
-  knock init [--provider telegram|bark] [provider options]
+  knock init [--provider telegram|bark|webhook] [provider options]
   knock provider add telegram --token <token> --chat-id <id>
   knock provider add bark --key <device-key> [--server https://api.day.app]
+  knock provider add webhook --url <url> [--method POST] [--auth-header Authorization] [--auth-value 'Bearer ...']
   knock send [--provider <name>] [--title <title>] [--severity info|high] <message>
   knock test [--provider <name>]
   knock profile use <claude|codex|gemini>
   knock profile list
+  knock rule list [--profile <name>]
+  knock rule add --name <rule-name> --pattern <regex> [--event <text>] [--idle <sec>] [--cooldown <sec>] [--severity info|high] [--profile <name>]
+  knock rule remove --name <rule-name> [--profile <name>]
   knock watch [--profile <name>] [--provider <name>] [--debug] -- <agent command>
   knock doctor
 `) 
@@ -131,17 +147,21 @@ Usage:
 
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	provider := fs.String("provider", "", "default provider: telegram or bark")
+	provider := fs.String("provider", "", "default provider: telegram, bark, or webhook")
 	token := fs.String("token", "", "telegram bot token")
 	chatID := fs.String("chat-id", "", "telegram chat id")
 	barkServer := fs.String("server", "https://api.day.app", "bark server url")
 	barkKey := fs.String("key", "", "bark device key")
+	webhookURL := fs.String("url", "", "webhook endpoint url")
+	webhookMethod := fs.String("method", "POST", "webhook method")
+	authHeader := fs.String("auth-header", "", "webhook auth header name")
+	authValue := fs.String("auth-value", "", "webhook auth header value")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	cfg := defaultConfig()
-	if err := configureProviderFromFlags(&cfg, *provider, *token, *chatID, *barkServer, *barkKey); err != nil {
+	if err := configureProviderFromFlags(&cfg, *provider, *token, *chatID, *barkServer, *barkKey, *webhookURL, *webhookMethod, *authHeader, *authValue); err != nil {
 		return err
 	}
 
@@ -155,10 +175,10 @@ func cmdInit(args []string) error {
 
 func cmdProvider(args []string) error {
 	if len(args) < 1 || args[0] != "add" {
-		return errors.New("usage: knock provider add <telegram|bark> [flags]")
+		return errors.New("usage: knock provider add <telegram|bark|webhook> [flags]")
 	}
 	if len(args) < 2 {
-		return errors.New("usage: knock provider add <telegram|bark> [flags]")
+		return errors.New("usage: knock provider add <telegram|bark|webhook> [flags]")
 	}
 
 	providerName := args[1]
@@ -190,6 +210,30 @@ func cmdProvider(args []string) error {
 			return errors.New("bark requires --key")
 		}
 		cfg.Providers.Bark = BarkProvider{Enabled: true, ServerURL: strings.TrimRight(*server, "/"), DeviceKey: *key}
+	case "webhook":
+		fs := flag.NewFlagSet("provider add webhook", flag.ContinueOnError)
+		endpoint := fs.String("url", "", "webhook endpoint url")
+		method := fs.String("method", "POST", "webhook method")
+		authHeader := fs.String("auth-header", "", "auth header name")
+		authValue := fs.String("auth-value", "", "auth header value")
+		timeout := fs.Int("timeout-ms", 8000, "request timeout in milliseconds")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*endpoint) == "" {
+			return errors.New("webhook requires --url")
+		}
+		if *timeout <= 0 {
+			return errors.New("timeout-ms must be > 0")
+		}
+		cfg.Providers.Webhook = WebhookProvider{
+			Enabled:      true,
+			URL:          strings.TrimSpace(*endpoint),
+			Method:       strings.ToUpper(strings.TrimSpace(*method)),
+			AuthHeader:   strings.TrimSpace(*authHeader),
+			AuthValue:    strings.TrimSpace(*authValue),
+			TimeoutMilli: *timeout,
+		}
 	default:
 		return fmt.Errorf("unsupported provider: %s", providerName)
 	}
@@ -310,6 +354,140 @@ func cmdProfile(args []string) error {
 		return nil
 	default:
 		return errors.New("usage: knock profile <use|list>")
+	}
+}
+
+func cmdRule(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: knock rule <list|add|remove>")
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "list":
+		fs := flag.NewFlagSet("rule list", flag.ContinueOnError)
+		profileName := fs.String("profile", "", "profile override")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		targetProfile := strings.TrimSpace(*profileName)
+		if targetProfile == "" {
+			targetProfile = cfg.ActiveProfile
+		}
+		profile, ok := cfg.Profiles[targetProfile]
+		if !ok {
+			return fmt.Errorf("profile not found: %s", targetProfile)
+		}
+		if len(profile.Rules) == 0 {
+			fmt.Printf("profile %s has no rules\n", targetProfile)
+			return nil
+		}
+		for i, r := range profile.Rules {
+			fmt.Printf("%d. %s pattern=%q event=%q idle=%ds cooldown=%ds severity=%s\n", i+1, r.Name, r.Pattern, r.Event, r.IdleSeconds, r.CooldownSeconds, r.Severity)
+		}
+		return nil
+	case "add":
+		fs := flag.NewFlagSet("rule add", flag.ContinueOnError)
+		profileName := fs.String("profile", "", "profile override")
+		name := fs.String("name", "", "rule name")
+		pattern := fs.String("pattern", "", "regex pattern")
+		event := fs.String("event", "Custom event", "event label")
+		idle := fs.Int("idle", 30, "idle seconds before alert")
+		cooldown := fs.Int("cooldown", 60, "cooldown seconds")
+		severity := fs.String("severity", "info", "severity info|high")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*name) == "" || strings.TrimSpace(*pattern) == "" {
+			return errors.New("rule add requires --name and --pattern")
+		}
+		if *idle < 0 || *cooldown < 0 {
+			return errors.New("idle and cooldown must be >= 0")
+		}
+		if _, err := regexp.Compile(*pattern); err != nil {
+			return fmt.Errorf("invalid regex pattern: %w", err)
+		}
+		normalizedSeverity := strings.ToLower(strings.TrimSpace(*severity))
+		if normalizedSeverity != "info" && normalizedSeverity != "high" {
+			return errors.New("severity must be info or high")
+		}
+
+		targetProfile := strings.TrimSpace(*profileName)
+		if targetProfile == "" {
+			targetProfile = cfg.ActiveProfile
+		}
+		profile, ok := cfg.Profiles[targetProfile]
+		if !ok {
+			return fmt.Errorf("profile not found: %s", targetProfile)
+		}
+		for _, r := range profile.Rules {
+			if r.Name == *name {
+				return fmt.Errorf("rule already exists in profile %s: %s", targetProfile, *name)
+			}
+		}
+
+		profile.Rules = append(profile.Rules, Rule{
+			Name:            *name,
+			Pattern:         *pattern,
+			Event:           *event,
+			IdleSeconds:     *idle,
+			CooldownSeconds: *cooldown,
+			Severity:        normalizedSeverity,
+		})
+		cfg.Profiles[targetProfile] = profile
+
+		path, err := saveConfig(cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Rule %s added to profile %s (%s)\n", *name, targetProfile, path)
+		return nil
+	case "remove":
+		fs := flag.NewFlagSet("rule remove", flag.ContinueOnError)
+		profileName := fs.String("profile", "", "profile override")
+		name := fs.String("name", "", "rule name")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*name) == "" {
+			return errors.New("rule remove requires --name")
+		}
+		targetProfile := strings.TrimSpace(*profileName)
+		if targetProfile == "" {
+			targetProfile = cfg.ActiveProfile
+		}
+		profile, ok := cfg.Profiles[targetProfile]
+		if !ok {
+			return fmt.Errorf("profile not found: %s", targetProfile)
+		}
+
+		nextRules := make([]Rule, 0, len(profile.Rules))
+		removed := false
+		for _, r := range profile.Rules {
+			if r.Name == *name {
+				removed = true
+				continue
+			}
+			nextRules = append(nextRules, r)
+		}
+		if !removed {
+			return fmt.Errorf("rule not found in profile %s: %s", targetProfile, *name)
+		}
+		profile.Rules = nextRules
+		cfg.Profiles[targetProfile] = profile
+
+		path, err := saveConfig(cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Rule %s removed from profile %s (%s)\n", *name, targetProfile, path)
+		return nil
+	default:
+		return errors.New("usage: knock rule <list|add|remove>")
 	}
 }
 
@@ -501,6 +679,11 @@ func cmdDoctor(args []string) error {
 	} else {
 		fmt.Println("- bark: disabled")
 	}
+	if cfg.Providers.Webhook.Enabled {
+		fmt.Println("- webhook: enabled")
+	} else {
+		fmt.Println("- webhook: disabled")
+	}
 
 	if cfg.DefaultProvider != "" {
 		if err := validateProvider(cfg, cfg.DefaultProvider); err != nil {
@@ -518,7 +701,7 @@ func cmdDoctor(args []string) error {
 	return nil
 }
 
-func configureProviderFromFlags(cfg *Config, provider, token, chatID, barkServer, barkKey string) error {
+func configureProviderFromFlags(cfg *Config, provider, token, chatID, barkServer, barkKey, webhookURL, webhookMethod, webhookAuthHeader, webhookAuthValue string) error {
 	switch provider {
 	case "":
 		return nil
@@ -534,6 +717,23 @@ func configureProviderFromFlags(cfg *Config, provider, token, chatID, barkServer
 		}
 		cfg.Providers.Bark = BarkProvider{Enabled: true, ServerURL: strings.TrimRight(barkServer, "/"), DeviceKey: barkKey}
 		cfg.DefaultProvider = "bark"
+	case "webhook":
+		if strings.TrimSpace(webhookURL) == "" {
+			return errors.New("webhook init requires --url")
+		}
+		method := strings.ToUpper(strings.TrimSpace(webhookMethod))
+		if method == "" {
+			method = "POST"
+		}
+		cfg.Providers.Webhook = WebhookProvider{
+			Enabled:      true,
+			URL:          strings.TrimSpace(webhookURL),
+			Method:       method,
+			AuthHeader:   strings.TrimSpace(webhookAuthHeader),
+			AuthValue:    strings.TrimSpace(webhookAuthValue),
+			TimeoutMilli: 8000,
+		}
+		cfg.DefaultProvider = "webhook"
 	default:
 		return fmt.Errorf("unsupported provider: %s", provider)
 	}
@@ -633,6 +833,8 @@ func sendNotification(cfg Config, provider string, n notification) error {
 		return sendTelegram(cfg.Providers.Telegram, n)
 	case "bark":
 		return sendBark(cfg.Providers.Bark, n)
+	case "webhook":
+		return sendWebhook(cfg.Providers.Webhook, n)
 	default:
 		return fmt.Errorf("unsupported provider: %s", provider)
 	}
@@ -650,6 +852,12 @@ func validateProvider(cfg Config, provider string) error {
 		p := cfg.Providers.Bark
 		if !p.Enabled || p.DeviceKey == "" || p.ServerURL == "" {
 			return errors.New("bark provider is not fully configured")
+		}
+		return nil
+	case "webhook":
+		p := cfg.Providers.Webhook
+		if !p.Enabled || strings.TrimSpace(p.URL) == "" {
+			return errors.New("webhook provider is not fully configured")
 		}
 		return nil
 	default:
@@ -693,6 +901,50 @@ func sendBark(p BarkProvider, n notification) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
 		return fmt.Errorf("bark status=%d body=%q", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func sendWebhook(p WebhookProvider, n notification) error {
+	method := strings.ToUpper(strings.TrimSpace(p.Method))
+	if method == "" {
+		method = "POST"
+	}
+	timeout := p.TimeoutMilli
+	if timeout <= 0 {
+		timeout = 8000
+	}
+
+	payload := map[string]string{
+		"title":     n.Title,
+		"body":      n.Body,
+		"severity":  strings.ToLower(strings.TrimSpace(n.Severity)),
+		"source":    "knock",
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(method, p.URL, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.AuthHeader != "" && p.AuthValue != "" {
+		req.Header.Set(p.AuthHeader, p.AuthValue)
+	}
+
+	client := &http.Client{Timeout: time.Duration(timeout) * time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+		return fmt.Errorf("webhook status=%d body=%q", resp.StatusCode, string(body))
 	}
 	return nil
 }

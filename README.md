@@ -11,6 +11,7 @@ It is designed for `claude`, `codex`, and `gemini` CLI workflows.
 - Alert when prompt is waiting and user is idle.
 - Built-in profiles for Claude/Codex/Gemini patterns.
 - Works with Telegram and Bark providers.
+- Works with Telegram, Bark, and generic Webhook providers.
 
 ## Install
 
@@ -32,6 +33,8 @@ go build -o knock .
 ./knock provider add telegram --token <BOT_TOKEN> --chat-id <CHAT_ID>
 # or
 ./knock provider add bark --key <DEVICE_KEY> --server https://api.day.app
+# or
+./knock provider add webhook --url <WEBHOOK_URL> --method POST --auth-header Authorization --auth-value "Bearer <TOKEN>"
 ```
 
 3. Send test notification:
@@ -53,10 +56,14 @@ go build -o knock .
 knock init
 knock provider add telegram --token <token> --chat-id <id>
 knock provider add bark --key <device-key> [--server <url>]
+knock provider add webhook --url <url> [--method POST] [--auth-header <header>] [--auth-value <value>]
 knock send [--provider <name>] [--title <title>] [--severity info|high] <message>
 knock test [--provider <name>]
 knock profile use <claude|codex|gemini>
 knock profile list
+knock rule list [--profile <name>]
+knock rule add --name <name> --pattern <regex> [--event <text>] [--idle <sec>] [--cooldown <sec>] [--severity info|high] [--profile <name>]
+knock rule remove --name <name> [--profile <name>]
 knock watch [--profile <name>] [--provider <name>] [--debug] -- <command>
 knock doctor
 ```
@@ -76,7 +83,6 @@ Config is stored at:
 
 ## Roadmap
 
-- Rule CRUD commands (`rule add/list/remove`)
-- Extra providers (Pushover, generic webhook)
+- Extra providers (Pushover)
 - Predefined wrappers for Claude/Codex/Gemini
 - GitHub Actions release pipeline

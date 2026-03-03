@@ -15,7 +15,7 @@
 ## Phase 3: Multi-Agent Profiles
 
 - Maintain built-in profiles for Claude/Codex/Gemini.
-- Add user rule operations (`rule add/list/remove`).
+- Add user rule operations (`rule add/list/remove`). (Implemented)
 - Support profile export/import.
 
 ## Phase 4: Distribution
