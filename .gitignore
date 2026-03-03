@@ -1,0 +1,9 @@
+# Binaries
+knock
+dist/
+
+# Local config and env
+.env
+
+# macOS
+.DS_Store
