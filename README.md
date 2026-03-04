@@ -1,17 +1,22 @@
 # knock
 
-`knock` is a lightweight CLI that notifies you when coding agents need attention.
+Agent notification infrastructure — the last mile between your coding agents and your attention.
 
-It is designed for `claude`, `codex`, and `gemini` CLI workflows.
+Zero dependencies. Single binary. Pure Go stdlib.
 
-## Features
+## What it does
 
-- Send push notifications from terminal events.
-- Watch agent output and detect approval prompts.
-- Alert when prompt is waiting and user is idle.
-- Built-in profiles for Claude/Codex/Gemini patterns.
-- Works with Telegram and Bark providers.
-- Works with Telegram, Bark, and generic Webhook providers.
+knock sits between your coding agents (Claude, Codex, Gemini) and your notification channels (Telegram, Bark, Webhook), solving the "I walked away and missed the prompt" problem.
+
+**Three layers of capability:**
+
+| Layer | Command | What it does |
+|-------|---------|-------------|
+| **Watch** | `knock watch` | Monitor agent stdout/stderr, match regex rules, alert when you're idle |
+| **Send** | `knock send` | One-shot notification from scripts, hooks, or CI |
+| **Listen** | `knock listen` | HTTP server that receives webhooks and forwards to your provider |
+
+**Telegram bidirectional interaction:** When a high-severity rule fires (e.g., agent asking for approval), knock sends a Telegram message with [Yes] / [No] inline buttons. Tap a button on your phone → the reply is piped directly into the agent's stdin. Authorize your agent from anywhere.
 
 ## Install
 
@@ -19,70 +24,196 @@ It is designed for `claude`, `codex`, and `gemini` CLI workflows.
 go build -o knock .
 ```
 
+Or grab a prebuilt binary from [Releases](https://github.com/zacfire/knock/releases).
+
 ## Quick Start
 
-1. Initialize config:
-
 ```bash
-./knock init
+# 1. Initialize config + add Telegram provider
+knock init --provider telegram --token <BOT_TOKEN> --chat-id <CHAT_ID>
+
+# 2. Verify setup
+knock doctor
+knock test
+
+# 3. Watch an agent
+knock watch -- claude
 ```
 
-2. Add provider:
+## Integration Patterns
 
-```bash
-./knock provider add telegram --token <BOT_TOKEN> --chat-id <CHAT_ID>
-# or
-./knock provider add bark --key <DEVICE_KEY> --server https://api.day.app
-# or
-./knock provider add webhook --url <WEBHOOK_URL> --method POST --auth-header Authorization --auth-value "Bearer <TOKEN>"
+### Claude Code hooks
+
+Add to `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "knock send --severity high 'Bash tool used'"
+          }
+        ]
+      }
+    ]
+  }
+}
 ```
 
-3. Send test notification:
+### Remote server notification
 
 ```bash
-./knock test
+# On your remote server, start the listener
+knock listen --port 9090 --token my-secret --provider telegram
+
+# From anywhere, send a notification
+curl -X POST http://your-server:9090/send \
+  -H "Authorization: Bearer my-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"deploy","body":"Build #42 completed","severity":"info"}'
 ```
 
-4. Watch an agent command:
+### Telegram remote authorization
 
 ```bash
-./knock profile use claude
-./knock watch -- claude
+# Watch an agent with Telegram as provider
+knock watch --provider telegram -- claude
+
+# When agent asks "Allow? [y/N]":
+# → Telegram receives message with [Yes] [No] buttons
+# → Tap [Yes] on your phone
+# → "y" is written to agent's stdin
+# → Agent proceeds
 ```
+
+This only activates for **severity=high** rules with Telegram provider. Other providers and severity levels work as normal one-way notifications.
 
 ## Commands
 
+### `knock init`
+
+Create config file with optional provider setup.
+
 ```bash
 knock init
+knock init --provider telegram --token <token> --chat-id <id>
+knock init --provider bark --key <device-key>
+knock init --provider webhook --url <url>
+```
+
+### `knock provider`
+
+Manage notification providers.
+
+```bash
 knock provider add telegram --token <token> --chat-id <id>
-knock provider add bark --key <device-key> [--server <url>]
-knock provider add webhook --url <url> [--method POST] [--auth-header <header>] [--auth-value <value>]
-knock send [--provider <name>] [--title <title>] [--severity info|high] <message>
-knock test [--provider <name>]
-knock profile use <claude|codex|gemini>
+knock provider add bark --key <device-key> [--server https://api.day.app]
+knock provider add webhook --url <url> [--method POST] [--auth-header Authorization] [--auth-value 'Bearer ...']
+knock provider use <telegram|bark|webhook>
+knock provider list
+```
+
+### `knock send`
+
+Send a one-off notification.
+
+```bash
+knock send "deployment complete"
+knock send --title "CI" --severity high "build failed"
+knock send --provider bark "quick ping"
+```
+
+### `knock test`
+
+Send a test notification to verify provider connectivity.
+
+```bash
+knock test
+knock test --provider telegram
+```
+
+### `knock listen`
+
+Start an HTTP server that receives webhook POSTs and forwards them as notifications.
+
+```bash
+knock listen                              # default port 9090
+knock listen --port 8080 --token secret   # custom port + bearer auth
+knock listen --provider bark              # override provider
+```
+
+**POST /send** payload:
+
+```json
+{
+  "title": "optional title",
+  "body": "notification body (required)",
+  "severity": "info|high"
+}
+```
+
+### `knock watch`
+
+Core feature. Monitor a subprocess and notify based on regex rules.
+
+```bash
+knock watch -- claude
+knock watch --profile codex -- codex
+knock watch --provider telegram --debug -- claude
+```
+
+### `knock profile`
+
+Switch between agent profiles (claude, codex, gemini).
+
+```bash
 knock profile list
-knock rule list [--profile <name>]
-knock rule add --name <name> --pattern <regex> [--event <text>] [--idle <sec>] [--cooldown <sec>] [--severity info|high] [--profile <name>]
-knock rule remove --name <name> [--profile <name>]
-knock watch [--profile <name>] [--provider <name>] [--debug] -- <command>
-knock doctor
+knock profile use codex
+```
+
+### `knock rule`
+
+Manage regex rules within profiles.
+
+```bash
+knock rule list
+knock rule add --name my-rule --pattern "DEPLOY" --event "Deploy detected" --idle 0 --cooldown 30 --severity high
+knock rule update --name my-rule --cooldown 60
+knock rule remove --name my-rule
+```
+
+### `knock doctor`
+
+Validate config and provider connectivity.
+
+### `knock version`
+
+Print current version.
+
+### `knock update check`
+
+Check for newer releases on GitHub.
+
+```bash
+knock update check
+knock update check --quiet
 ```
 
 ## Config
 
 Config is stored at:
 
-- macOS: `$HOME/Library/Application Support/knock/config.json`
-- Linux: `$XDG_CONFIG_HOME/knock/config.json` or `$HOME/.config/knock/config.json`
+- **macOS:** `~/Library/Application Support/knock/config.json`
+- **Linux:** `~/.config/knock/config.json`
+- **Override:** `KNOCK_CONFIG_PATH` environment variable
 
-## Build Multi-Platform Binaries
+## Build
 
 ```bash
-./scripts/build.sh
+go build -o knock .           # local build
+./scripts/build.sh             # cross-platform (darwin/linux × amd64/arm64)
 ```
-
-## Roadmap
-
-- Extra providers (Pushover)
-- Predefined wrappers for Claude/Codex/Gemini
-- GitHub Actions release pipeline

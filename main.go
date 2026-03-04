@@ -16,18 +16,35 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-const appName = "knock"
+const (
+	appName           = "knock"
+	appVersion        = "0.2.0"
+	updateRepoURL     = "https://api.github.com/repos/zacfire/knock/releases/latest"
+	updateCheckPeriod = 24 * time.Hour
+)
 
 type Config struct {
 	DefaultProvider string             `json:"default_provider"`
 	ActiveProfile   string             `json:"active_profile"`
 	Providers       ProviderCollection `json:"providers"`
 	Profiles        map[string]Profile `json:"profiles"`
+	Metadata        Metadata           `json:"metadata,omitempty"`
+}
+
+type Metadata struct {
+	Update UpdateMetadata `json:"update,omitempty"`
+}
+
+type UpdateMetadata struct {
+	LastCheckedAt string `json:"last_checked_at,omitempty"`
+	LastNoticedAt string `json:"last_noticed_at,omitempty"`
+	LatestVersion string `json:"latest_version,omitempty"`
 }
 
 type ProviderCollection struct {
@@ -94,6 +111,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	maybeRunPassiveUpdateReminder(os.Args[1])
+
 	var err error
 	switch os.Args[1] {
 	case "init":
@@ -108,10 +127,17 @@ func main() {
 		err = cmdProfile(os.Args[2:])
 	case "rule":
 		err = cmdRule(os.Args[2:])
+	case "update":
+		err = cmdUpdate(os.Args[2:])
+	case "listen":
+		err = cmdListen(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "version", "--version", "-v":
+		fmt.Printf("knock %s\n", appVersion)
+		return
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -133,15 +159,21 @@ Usage:
   knock provider add telegram --token <token> --chat-id <id>
   knock provider add bark --key <device-key> [--server https://api.day.app]
   knock provider add webhook --url <url> [--method POST] [--auth-header Authorization] [--auth-value 'Bearer ...']
+  knock provider use <telegram|bark|webhook>
+  knock provider list
   knock send [--provider <name>] [--title <title>] [--severity info|high] <message>
   knock test [--provider <name>]
   knock profile use <claude|codex|gemini>
   knock profile list
   knock rule list [--profile <name>]
   knock rule add --name <rule-name> --pattern <regex> [--event <text>] [--idle <sec>] [--cooldown <sec>] [--severity info|high] [--profile <name>]
+  knock rule update --name <rule-name> [--new-name <name>] [--pattern <regex>] [--event <text>] [--idle <sec>] [--cooldown <sec>] [--severity info|high] [--profile <name>]
   knock rule remove --name <rule-name> [--profile <name>]
+  knock update check [--quiet]
+  knock listen [--port 9090] [--provider <name>] [--token <bearer-token>]
   knock watch [--profile <name>] [--provider <name>] [--debug] -- <agent command>
   knock doctor
+  knock version
 `) 
 }
 
@@ -174,80 +206,123 @@ func cmdInit(args []string) error {
 }
 
 func cmdProvider(args []string) error {
-	if len(args) < 1 || args[0] != "add" {
-		return errors.New("usage: knock provider add <telegram|bark|webhook> [flags]")
-	}
-	if len(args) < 2 {
-		return errors.New("usage: knock provider add <telegram|bark|webhook> [flags]")
+	if len(args) < 1 {
+		return errors.New("usage: knock provider <add|use|list> ...")
 	}
 
-	providerName := args[1]
 	cfg, err := loadOrDefaultConfig()
 	if err != nil {
 		return err
 	}
 
-	switch providerName {
-	case "telegram":
-		fs := flag.NewFlagSet("provider add telegram", flag.ContinueOnError)
-		token := fs.String("token", "", "telegram bot token")
-		chatID := fs.String("chat-id", "", "telegram chat id")
-		if err := fs.Parse(args[2:]); err != nil {
-			return err
+	switch args[0] {
+	case "add":
+		if len(args) < 2 {
+			return errors.New("usage: knock provider add <telegram|bark|webhook> [flags]")
 		}
-		if *token == "" || *chatID == "" {
-			return errors.New("telegram requires --token and --chat-id")
+		providerName := args[1]
+		switch providerName {
+		case "telegram":
+			fs := flag.NewFlagSet("provider add telegram", flag.ContinueOnError)
+			token := fs.String("token", "", "telegram bot token")
+			chatID := fs.String("chat-id", "", "telegram chat id")
+			if err := fs.Parse(args[2:]); err != nil {
+				return err
+			}
+			if *token == "" || *chatID == "" {
+				return errors.New("telegram requires --token and --chat-id")
+			}
+			cfg.Providers.Telegram = TelegramProvider{Enabled: true, BotToken: *token, ChatID: *chatID}
+		case "bark":
+			fs := flag.NewFlagSet("provider add bark", flag.ContinueOnError)
+			server := fs.String("server", "https://api.day.app", "bark server url")
+			key := fs.String("key", "", "bark device key")
+			if err := fs.Parse(args[2:]); err != nil {
+				return err
+			}
+			if *key == "" {
+				return errors.New("bark requires --key")
+			}
+			cfg.Providers.Bark = BarkProvider{Enabled: true, ServerURL: strings.TrimRight(*server, "/"), DeviceKey: *key}
+		case "webhook":
+			fs := flag.NewFlagSet("provider add webhook", flag.ContinueOnError)
+			endpoint := fs.String("url", "", "webhook endpoint url")
+			method := fs.String("method", "POST", "webhook method")
+			authHeader := fs.String("auth-header", "", "auth header name")
+			authValue := fs.String("auth-value", "", "auth header value")
+			timeout := fs.Int("timeout-ms", 8000, "request timeout in milliseconds")
+			if err := fs.Parse(args[2:]); err != nil {
+				return err
+			}
+			if strings.TrimSpace(*endpoint) == "" {
+				return errors.New("webhook requires --url")
+			}
+			if *timeout <= 0 {
+				return errors.New("timeout-ms must be > 0")
+			}
+			cfg.Providers.Webhook = WebhookProvider{
+				Enabled:      true,
+				URL:          strings.TrimSpace(*endpoint),
+				Method:       strings.ToUpper(strings.TrimSpace(*method)),
+				AuthHeader:   strings.TrimSpace(*authHeader),
+				AuthValue:    strings.TrimSpace(*authValue),
+				TimeoutMilli: *timeout,
+			}
+		default:
+			return fmt.Errorf("unsupported provider: %s", providerName)
 		}
-		cfg.Providers.Telegram = TelegramProvider{Enabled: true, BotToken: *token, ChatID: *chatID}
-	case "bark":
-		fs := flag.NewFlagSet("provider add bark", flag.ContinueOnError)
-		server := fs.String("server", "https://api.day.app", "bark server url")
-		key := fs.String("key", "", "bark device key")
-		if err := fs.Parse(args[2:]); err != nil {
-			return err
-		}
-		if *key == "" {
-			return errors.New("bark requires --key")
-		}
-		cfg.Providers.Bark = BarkProvider{Enabled: true, ServerURL: strings.TrimRight(*server, "/"), DeviceKey: *key}
-	case "webhook":
-		fs := flag.NewFlagSet("provider add webhook", flag.ContinueOnError)
-		endpoint := fs.String("url", "", "webhook endpoint url")
-		method := fs.String("method", "POST", "webhook method")
-		authHeader := fs.String("auth-header", "", "auth header name")
-		authValue := fs.String("auth-value", "", "auth header value")
-		timeout := fs.Int("timeout-ms", 8000, "request timeout in milliseconds")
-		if err := fs.Parse(args[2:]); err != nil {
-			return err
-		}
-		if strings.TrimSpace(*endpoint) == "" {
-			return errors.New("webhook requires --url")
-		}
-		if *timeout <= 0 {
-			return errors.New("timeout-ms must be > 0")
-		}
-		cfg.Providers.Webhook = WebhookProvider{
-			Enabled:      true,
-			URL:          strings.TrimSpace(*endpoint),
-			Method:       strings.ToUpper(strings.TrimSpace(*method)),
-			AuthHeader:   strings.TrimSpace(*authHeader),
-			AuthValue:    strings.TrimSpace(*authValue),
-			TimeoutMilli: *timeout,
-		}
-	default:
-		return fmt.Errorf("unsupported provider: %s", providerName)
-	}
 
-	if cfg.DefaultProvider == "" {
+		if cfg.DefaultProvider == "" {
+			cfg.DefaultProvider = providerName
+		}
+		path, err := saveConfig(cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Provider %s configured in %s\n", providerName, path)
+		return nil
+	case "use":
+		if len(args) < 2 {
+			return errors.New("usage: knock provider use <telegram|bark|webhook>")
+		}
+		providerName := strings.TrimSpace(args[1])
+		if err := validateProvider(cfg, providerName); err != nil {
+			return err
+		}
 		cfg.DefaultProvider = providerName
-	}
+		path, err := saveConfig(cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Default provider set to %s (%s)\n", providerName, path)
+		return nil
+	case "list":
+		defaultMarker := func(name string) string {
+			if name == cfg.DefaultProvider {
+				return "*"
+			}
+			return " "
+		}
+		telegramStatus := "disabled"
+		if cfg.Providers.Telegram.Enabled {
+			telegramStatus = "enabled"
+		}
+		barkStatus := "disabled"
+		if cfg.Providers.Bark.Enabled {
+			barkStatus = "enabled"
+		}
+		webhookStatus := "disabled"
+		if cfg.Providers.Webhook.Enabled {
+			webhookStatus = "enabled"
+		}
 
-	path, err := saveConfig(cfg)
-	if err != nil {
-		return err
+		fmt.Printf("%s telegram (%s)\n", defaultMarker("telegram"), telegramStatus)
+		fmt.Printf("%s bark (%s)\n", defaultMarker("bark"), barkStatus)
+		fmt.Printf("%s webhook (%s)\n", defaultMarker("webhook"), webhookStatus)
+		return nil
+	default:
+		return errors.New("usage: knock provider <add|use|list> ...")
 	}
-	fmt.Printf("Provider %s configured in %s\n", providerName, path)
-	return nil
 }
 
 func cmdSend(args []string) error {
@@ -359,7 +434,7 @@ func cmdProfile(args []string) error {
 
 func cmdRule(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: knock rule <list|add|remove>")
+		return errors.New("usage: knock rule <list|add|update|remove>")
 	}
 
 	cfg, err := loadConfig()
@@ -446,6 +521,88 @@ func cmdRule(args []string) error {
 		}
 		fmt.Printf("Rule %s added to profile %s (%s)\n", *name, targetProfile, path)
 		return nil
+	case "update":
+		fs := flag.NewFlagSet("rule update", flag.ContinueOnError)
+		profileName := fs.String("profile", "", "profile override")
+		name := fs.String("name", "", "existing rule name")
+		newName := fs.String("new-name", "", "new rule name")
+		pattern := fs.String("pattern", "", "regex pattern")
+		event := fs.String("event", "", "event label")
+		idle := fs.Int("idle", -1, "idle seconds before alert")
+		cooldown := fs.Int("cooldown", -1, "cooldown seconds")
+		severity := fs.String("severity", "", "severity info|high")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*name) == "" {
+			return errors.New("rule update requires --name")
+		}
+
+		targetProfile := strings.TrimSpace(*profileName)
+		if targetProfile == "" {
+			targetProfile = cfg.ActiveProfile
+		}
+		profile, ok := cfg.Profiles[targetProfile]
+		if !ok {
+			return fmt.Errorf("profile not found: %s", targetProfile)
+		}
+
+		ruleIndex := -1
+		for i, r := range profile.Rules {
+			if r.Name == *name {
+				ruleIndex = i
+				break
+			}
+		}
+		if ruleIndex < 0 {
+			return fmt.Errorf("rule not found in profile %s: %s", targetProfile, *name)
+		}
+
+		if strings.TrimSpace(*newName) == "" && strings.TrimSpace(*pattern) == "" && strings.TrimSpace(*event) == "" && *idle < 0 && *cooldown < 0 && strings.TrimSpace(*severity) == "" {
+			return errors.New("rule update requires at least one change flag")
+		}
+
+		updatedRule := profile.Rules[ruleIndex]
+		if strings.TrimSpace(*newName) != "" {
+			for i, r := range profile.Rules {
+				if i != ruleIndex && r.Name == *newName {
+					return fmt.Errorf("rule already exists in profile %s: %s", targetProfile, *newName)
+				}
+			}
+			updatedRule.Name = strings.TrimSpace(*newName)
+		}
+		if strings.TrimSpace(*pattern) != "" {
+			if _, err := regexp.Compile(*pattern); err != nil {
+				return fmt.Errorf("invalid regex pattern: %w", err)
+			}
+			updatedRule.Pattern = *pattern
+		}
+		if strings.TrimSpace(*event) != "" {
+			updatedRule.Event = *event
+		}
+		if *idle >= 0 {
+			updatedRule.IdleSeconds = *idle
+		}
+		if *cooldown >= 0 {
+			updatedRule.CooldownSeconds = *cooldown
+		}
+		if strings.TrimSpace(*severity) != "" {
+			normalizedSeverity := strings.ToLower(strings.TrimSpace(*severity))
+			if normalizedSeverity != "info" && normalizedSeverity != "high" {
+				return errors.New("severity must be info or high")
+			}
+			updatedRule.Severity = normalizedSeverity
+		}
+
+		profile.Rules[ruleIndex] = updatedRule
+		cfg.Profiles[targetProfile] = profile
+
+		path, err := saveConfig(cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Rule %s updated in profile %s (%s)\n", *name, targetProfile, path)
+		return nil
 	case "remove":
 		fs := flag.NewFlagSet("rule remove", flag.ContinueOnError)
 		profileName := fs.String("profile", "", "profile override")
@@ -487,8 +644,101 @@ func cmdRule(args []string) error {
 		fmt.Printf("Rule %s removed from profile %s (%s)\n", *name, targetProfile, path)
 		return nil
 	default:
-		return errors.New("usage: knock rule <list|add|remove>")
+		return errors.New("usage: knock rule <list|add|update|remove>")
 	}
+}
+
+type listenPayload struct {
+	Title    string `json:"title"`
+	Body     string `json:"body"`
+	Severity string `json:"severity"`
+}
+
+func cmdListen(args []string) error {
+	fs := flag.NewFlagSet("listen", flag.ContinueOnError)
+	port := fs.Int("port", 9090, "listen port")
+	providerOverride := fs.String("provider", "", "provider override")
+	token := fs.String("token", "", "bearer token for authentication")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	targetProvider := strings.TrimSpace(*providerOverride)
+	if targetProvider == "" {
+		targetProvider = cfg.DefaultProvider
+	}
+	if targetProvider == "" {
+		return errors.New("no provider configured")
+	}
+	if err := validateProvider(cfg, targetProvider); err != nil {
+		return err
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if *token != "" {
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+*token {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		var p listenPayload
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&p); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(p.Body) == "" {
+			http.Error(w, "body is required", http.StatusBadRequest)
+			return
+		}
+		title := p.Title
+		if title == "" {
+			title = "knock"
+		}
+		severity := strings.ToLower(strings.TrimSpace(p.Severity))
+		if severity == "" {
+			severity = "info"
+		}
+		if err := sendNotification(cfg, targetProvider, notification{Title: title, Body: p.Body, Severity: severity}); err != nil {
+			fmt.Fprintf(os.Stderr, "[knock] notify failed: %v\n", err)
+			http.Error(w, "notification failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"ok":true}`)
+	})
+
+	srv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", *port),
+		Handler: mux,
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigCh
+		fmt.Println("\nshutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
+	fmt.Printf("listening on :%d (provider=%s, auth=%v)\n", *port, targetProvider, *token != "")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 func cmdWatch(args []string) error {
@@ -576,6 +826,21 @@ func cmdWatch(args []string) error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
+	// Telegram bidirectional: start callback poller when provider is telegram
+	telegramInteractive := targetProvider == "telegram" && cfg.Providers.Telegram.Enabled
+	replyCh := make(chan string, 8)
+	if telegramInteractive {
+		go pollTelegramCallbacks(ctx, cfg.Providers.Telegram, replyCh)
+	}
+
+	// watchNotify sends a notification, using interactive mode for telegram+high severity
+	watchNotify := func(n notification) error {
+		if telegramInteractive && strings.ToLower(n.Severity) == "high" {
+			return sendTelegramInteractive(cfg.Providers.Telegram, n)
+		}
+		return sendNotification(cfg, targetProvider, n)
+	}
+
 	fmt.Printf("watching %q with profile=%s provider=%s\n", strings.Join(cmdArgs, " "), profileName, targetProvider)
 
 	lastInput := time.Now()
@@ -589,6 +854,15 @@ func cmdWatch(args []string) error {
 		case <-inputCh:
 			lastInput = time.Now()
 			pending = nil
+		case reply := <-replyCh:
+			// Telegram button reply → write to child stdin
+			lastInput = time.Now()
+			pending = nil
+			if _, err := fmt.Fprintln(stdinPipe, reply); err != nil {
+				fmt.Fprintf(os.Stderr, "[knock] failed to write reply to stdin: %v\n", err)
+			} else if *debug {
+				fmt.Printf("[knock-debug] telegram reply=%q written to stdin\n", reply)
+			}
 		case line := <-lineCh:
 			fmt.Println(line)
 			now := time.Now()
@@ -607,7 +881,7 @@ func cmdWatch(args []string) error {
 				}
 				if r.IdleSeconds <= 0 {
 					msg := fmt.Sprintf("%s: %s", r.Event, line)
-					if err := sendNotification(cfg, targetProvider, notification{Title: "knock", Body: msg, Severity: r.Severity}); err != nil {
+					if err := watchNotify(notification{Title: "knock", Body: msg, Severity: r.Severity}); err != nil {
 						fmt.Fprintf(os.Stderr, "[knock] notify failed: %v\n", err)
 					} else {
 						cooldownUntil[r.Name] = now.Add(time.Duration(r.CooldownSeconds) * time.Second)
@@ -633,7 +907,7 @@ func cmdWatch(args []string) error {
 				continue
 			}
 			msg := fmt.Sprintf("%s: no input for %ds after %q", pending.Rule.Event, pending.Rule.IdleSeconds, pending.Line)
-			if err := sendNotification(cfg, targetProvider, notification{Title: "knock", Body: msg, Severity: pending.Rule.Severity}); err != nil {
+			if err := watchNotify(notification{Title: "knock", Body: msg, Severity: pending.Rule.Severity}); err != nil {
 				fmt.Fprintf(os.Stderr, "[knock] notify failed: %v\n", err)
 			} else {
 				cooldownUntil[pending.Rule.Name] = now.Add(time.Duration(pending.Rule.CooldownSeconds) * time.Second)
@@ -865,6 +1139,127 @@ func validateProvider(cfg Config, provider string) error {
 	}
 }
 
+// --- Telegram interactive (bidirectional) ---
+
+type telegramSendResult struct {
+	OK     bool `json:"ok"`
+	Result struct {
+		MessageID int `json:"message_id"`
+	} `json:"result"`
+}
+
+type telegramUpdate struct {
+	UpdateID      int                    `json:"update_id"`
+	CallbackQuery *telegramCallbackQuery `json:"callback_query"`
+}
+
+type telegramCallbackQuery struct {
+	ID      string `json:"id"`
+	From    struct{ ID int `json:"id"` } `json:"from"`
+	Message struct {
+		Chat struct{ ID int64 `json:"id"` } `json:"chat"`
+	} `json:"message"`
+	Data string `json:"data"`
+}
+
+type telegramUpdatesResponse struct {
+	OK     bool             `json:"ok"`
+	Result []telegramUpdate `json:"result"`
+}
+
+func sendTelegramInteractive(p TelegramProvider, n notification) error {
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", p.BotToken)
+	text := formatMessage(n)
+
+	keyboard := map[string]interface{}{
+		"inline_keyboard": [][]map[string]string{
+			{
+				{"text": "Yes", "callback_data": "y"},
+				{"text": "No", "callback_data": "n"},
+			},
+		},
+	}
+	kbJSON, _ := json.Marshal(keyboard)
+
+	payload := url.Values{}
+	payload.Set("chat_id", p.ChatID)
+	payload.Set("text", text)
+	payload.Set("disable_web_page_preview", "true")
+	payload.Set("reply_markup", string(kbJSON))
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.PostForm(endpoint, payload)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+		return fmt.Errorf("telegram status=%d body=%q", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func pollTelegramCallbacks(ctx context.Context, p TelegramProvider, replyCh chan<- string) {
+	client := &http.Client{Timeout: 35 * time.Second}
+	offset := 0
+	chatID, _ := strconv.ParseInt(p.ChatID, 10, 64)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=30&allowed_updates=[\"callback_query\"]&offset=%d", p.BotToken, offset)
+		resp, err := client.Get(endpoint)
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		var updates telegramUpdatesResponse
+		if err := json.Unmarshal(body, &updates); err != nil || !updates.OK {
+			continue
+		}
+
+		for _, u := range updates.Result {
+			offset = u.UpdateID + 1
+			if u.CallbackQuery == nil {
+				continue
+			}
+			cb := u.CallbackQuery
+			if cb.Message.Chat.ID != chatID {
+				continue
+			}
+			answerCallbackQuery(p.BotToken, cb.ID)
+			select {
+			case replyCh <- cb.Data:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func answerCallbackQuery(token, callbackID string) {
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", token)
+	payload := url.Values{}
+	payload.Set("callback_query_id", callbackID)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.PostForm(endpoint, payload)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
 func sendTelegram(p TelegramProvider, n notification) error {
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", p.BotToken)
 	text := formatMessage(n)
@@ -958,6 +1353,9 @@ func formatMessage(n notification) string {
 }
 
 func configPath() (string, error) {
+	if envPath := os.Getenv("KNOCK_CONFIG_PATH"); envPath != "" {
+		return envPath, nil
+	}
 	root, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
@@ -1034,4 +1432,130 @@ func valueOr(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+// --- update check ---
+
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+}
+
+func cmdUpdate(args []string) error {
+	if len(args) < 1 || args[0] != "check" {
+		return errors.New("usage: knock update check [--quiet]")
+	}
+
+	fs := flag.NewFlagSet("update check", flag.ContinueOnError)
+	quiet := fs.Bool("quiet", false, "only print when update available")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	latest, err := fetchLatestVersion()
+	if err != nil {
+		return fmt.Errorf("failed to check for updates: %w", err)
+	}
+
+	// persist check timestamp
+	cfg, _ := loadOrDefaultConfig()
+	cfg.Metadata.Update.LastCheckedAt = time.Now().UTC().Format(time.RFC3339)
+	cfg.Metadata.Update.LatestVersion = latest
+	_, _ = saveConfig(cfg)
+
+	if isNewerVersion(latest, appVersion) {
+		fmt.Printf("Update available: %s -> %s\n", appVersion, latest)
+		fmt.Printf("  https://github.com/zacfire/knock/releases/latest\n")
+		return nil
+	}
+
+	if !*quiet {
+		fmt.Printf("knock %s is up to date\n", appVersion)
+	}
+	return nil
+}
+
+func fetchLatestVersion() (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(updateRepoURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("github api status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", err
+	}
+	var rel githubRelease
+	if err := json.Unmarshal(body, &rel); err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(rel.TagName, "v"), nil
+}
+
+// isNewerVersion returns true if latest > current using simple numeric comparison.
+func isNewerVersion(latest, current string) bool {
+	latestParts := strings.Split(latest, ".")
+	currentParts := strings.Split(current, ".")
+	maxLen := len(latestParts)
+	if len(currentParts) > maxLen {
+		maxLen = len(currentParts)
+	}
+	for i := 0; i < maxLen; i++ {
+		var l, c int
+		if i < len(latestParts) {
+			l, _ = strconv.Atoi(latestParts[i])
+		}
+		if i < len(currentParts) {
+			c, _ = strconv.Atoi(currentParts[i])
+		}
+		if l > c {
+			return true
+		}
+		if l < c {
+			return false
+		}
+	}
+	return false
+}
+
+func maybeRunPassiveUpdateReminder(command string) {
+	if command == "update" {
+		return
+	}
+
+	cfg, err := loadOrDefaultConfig()
+	if err != nil {
+		return
+	}
+
+	// if we already know about a newer version, remind (at most once per 24h)
+	if cfg.Metadata.Update.LatestVersion != "" && isNewerVersion(cfg.Metadata.Update.LatestVersion, appVersion) {
+		lastNoticed, _ := time.Parse(time.RFC3339, cfg.Metadata.Update.LastNoticedAt)
+		if time.Since(lastNoticed) > updateCheckPeriod {
+			fmt.Fprintf(os.Stderr, "hint: knock %s available (current: %s). Run: knock update check\n", cfg.Metadata.Update.LatestVersion, appVersion)
+			cfg.Metadata.Update.LastNoticedAt = time.Now().UTC().Format(time.RFC3339)
+			_, _ = saveConfig(cfg)
+		}
+	}
+
+	// trigger background check if stale
+	lastChecked, _ := time.Parse(time.RFC3339, cfg.Metadata.Update.LastCheckedAt)
+	if time.Since(lastChecked) > updateCheckPeriod {
+		go func() {
+			latest, err := fetchLatestVersion()
+			if err != nil {
+				return
+			}
+			c, err := loadOrDefaultConfig()
+			if err != nil {
+				return
+			}
+			c.Metadata.Update.LastCheckedAt = time.Now().UTC().Format(time.RFC3339)
+			c.Metadata.Update.LatestVersion = latest
+			_, _ = saveConfig(c)
+		}()
+	}
 }
