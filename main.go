@@ -1030,7 +1030,7 @@ func defaultProfiles() map[string]Profile {
 			Name: "claude",
 			Rules: []Rule{
 				{Name: "approval", Pattern: `(?i)allow\?.*\[y/?n\]`, Event: "Approval required", IdleSeconds: 30, CooldownSeconds: 120, Severity: "high"},
-				{Name: "task_complete", Pattern: `(?i)(task|plan)\\s+complete`, Event: "Task completed", IdleSeconds: 0, CooldownSeconds: 60, Severity: "info"},
+				{Name: "task_complete", Pattern: `(?i)(task|plan)\s+complete`, Event: "Task completed", IdleSeconds: 0, CooldownSeconds: 60, Severity: "info"},
 				{Name: "error", Pattern: `(?i)(error|failed|exception)`, Event: "Error detected", IdleSeconds: 15, CooldownSeconds: 60, Severity: "high"},
 			},
 		},
