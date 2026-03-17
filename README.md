@@ -111,9 +111,83 @@ source ~/.zshrc
 
 ## Integration Patterns
 
-### Claude Code hooks
+### Claude Code hooks (recommended)
 
-Add to `.claude/settings.json`:
+The best way to use knock with Claude Code — no wrapper needed, works with your existing `claude` command.
+
+**Auto-notify when Claude finishes long tasks (>60s):**
+
+1. Create two hook scripts:
+
+```bash
+mkdir -p ~/.claude/hooks
+
+# Record when user submits a prompt
+cat > ~/.claude/hooks/record-start.sh << 'EOF'
+#!/bin/bash
+date +%s > /tmp/knock-prompt-start
+EOF
+
+# Notify only if Claude took >60 seconds
+cat > ~/.claude/hooks/notify-if-long.sh << 'EOF'
+#!/bin/bash
+THRESHOLD=60
+START_FILE=/tmp/knock-prompt-start
+
+if [ ! -f "$START_FILE" ]; then
+  exit 0
+fi
+
+start=$(cat "$START_FILE")
+now=$(date +%s)
+elapsed=$((now - start))
+
+if [ "$elapsed" -ge "$THRESHOLD" ]; then
+  knock send --provider local "Claude done (${elapsed}s)"
+fi
+
+rm -f "$START_FILE"
+EOF
+
+chmod +x ~/.claude/hooks/record-start.sh ~/.claude/hooks/notify-if-long.sh
+```
+
+2. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/record-start.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/notify-if-long.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Now every time Claude takes more than 60 seconds to respond, you get a macOS notification automatically. Adjust `THRESHOLD` in the script to change the delay.
+
+> **Tip:** For Telegram notifications in hooks, replace `--provider local` with `--provider local,telegram`. Make sure `https_proxy` is set if Telegram is blocked in your region.
+
+### Claude Code hooks (simple)
+
+For simpler use cases like monitoring specific tool usage:
 
 ```json
 {
