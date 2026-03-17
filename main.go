@@ -168,8 +168,8 @@ Usage:
   knock provider add local [--sound default]
   knock provider use <telegram|bark|webhook|local>
   knock provider list
-  knock send [--provider <name>] [--title <title>] [--severity info|high] <message>
-  knock test [--provider <name>]
+  knock send [--provider <name>[,<name>]] [--title <title>] [--severity info|high] <message>
+  knock test [--provider <name>[,<name>]]
   knock profile use <claude|codex|gemini>
   knock profile list
   knock rule list [--profile <name>]
@@ -178,7 +178,7 @@ Usage:
   knock rule remove --name <rule-name> [--profile <name>]
   knock update check [--quiet]
   knock listen [--port 9090] [--provider <name>] [--token <bearer-token>]
-  knock watch [--profile <name>] [--provider <name>] [--debug] -- <agent command>
+  knock watch [--profile <name>] [--provider <name>[,<name>]] [--debug] -- <agent command>
   knock doctor
   knock version
 `) 
@@ -845,8 +845,15 @@ func cmdWatch(args []string) error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// Telegram bidirectional: start callback poller when provider is telegram
-	telegramInteractive := targetProvider == "telegram" && cfg.Providers.Telegram.Enabled
+	// Telegram bidirectional: start callback poller when telegram is among providers
+	providerList := strings.Split(targetProvider, ",")
+	telegramInteractive := false
+	for _, p := range providerList {
+		if strings.TrimSpace(p) == "telegram" && cfg.Providers.Telegram.Enabled {
+			telegramInteractive = true
+			break
+		}
+	}
 	replyCh := make(chan string, 8)
 	if telegramInteractive {
 		go pollTelegramCallbacks(ctx, cfg.Providers.Telegram, replyCh)
@@ -855,7 +862,24 @@ func cmdWatch(args []string) error {
 	// watchNotify sends a notification, using interactive mode for telegram+high severity
 	watchNotify := func(n notification) error {
 		if telegramInteractive && strings.ToLower(n.Severity) == "high" {
-			return sendTelegramInteractive(cfg.Providers.Telegram, n)
+			// Send interactive to telegram, and also notify other providers
+			var errs []string
+			if err := sendTelegramInteractive(cfg.Providers.Telegram, n); err != nil {
+				errs = append(errs, fmt.Sprintf("telegram: %v", err))
+			}
+			for _, p := range providerList {
+				p = strings.TrimSpace(p)
+				if p == "telegram" || p == "" {
+					continue
+				}
+				if err := sendSingleNotification(cfg, p, n); err != nil {
+					errs = append(errs, fmt.Sprintf("%s: %v", p, err))
+				}
+			}
+			if len(errs) > 0 {
+				return fmt.Errorf("notification errors: %s", strings.Join(errs, "; "))
+			}
+			return nil
 		}
 		return sendNotification(cfg, targetProvider, n)
 	}
@@ -1125,6 +1149,25 @@ func proxyInput(src io.Reader, dst io.WriteCloser, inputCh chan<- struct{}) {
 }
 
 func sendNotification(cfg Config, provider string, n notification) error {
+	// Support comma-separated providers, e.g. "local,telegram"
+	providers := strings.Split(provider, ",")
+	var errs []string
+	for _, p := range providers {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if err := sendSingleNotification(cfg, p, n); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", p, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("notification errors: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func sendSingleNotification(cfg Config, provider string, n notification) error {
 	if err := validateProvider(cfg, provider); err != nil {
 		return err
 	}

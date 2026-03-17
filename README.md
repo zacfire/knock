@@ -6,7 +6,18 @@ Zero dependencies. Single binary. Pure Go stdlib.
 
 ## What it does
 
-knock sits between your coding agents (Claude, Codex, Gemini) and your notification channels (Telegram, Bark, Webhook), solving the "I walked away and missed the prompt" problem.
+knock sits between your coding agents (Claude, Codex, Gemini) and your notification channels, solving the "I walked away and missed the prompt" problem.
+
+**Supported providers:**
+
+| Provider | Platform | What it does |
+|----------|----------|-------------|
+| **local** | macOS | Native system notification (no setup needed) |
+| **telegram** | Cross-platform | Push to your phone via Telegram Bot, with bidirectional interaction |
+| **bark** | iOS | Push via [Bark](https://github.com/Finb/Bark) app |
+| **webhook** | Any | HTTP POST to any endpoint (Slack, Discord, Feishu, etc.) |
+
+**Multi-provider support:** Use comma-separated providers to notify multiple channels at once: `--provider local,telegram`
 
 **Three layers of capability:**
 
@@ -21,23 +32,81 @@ knock sits between your coding agents (Claude, Codex, Gemini) and your notificat
 ## Install
 
 ```bash
+# From source
+go install github.com/zacfire/knock@latest
+
+# Or build locally
 go build -o knock .
 ```
 
 Or grab a prebuilt binary from [Releases](https://github.com/zacfire/knock/releases).
 
-## Quick Start
+Make sure `~/go/bin` is in your PATH:
 
 ```bash
-# 1. Initialize config + add Telegram provider
-knock init --provider telegram --token <BOT_TOKEN> --chat-id <CHAT_ID>
+echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
 
-# 2. Verify setup
+## Quick Start
+
+### macOS local notification (simplest)
+
+```bash
+# 1. Initialize with local provider
+knock init --provider local
+
+# 2. Verify
 knock doctor
-knock test
+knock test    # you should see a macOS notification
 
 # 3. Watch an agent
 knock watch -- claude
+```
+
+### Telegram (remote push to phone)
+
+```bash
+# 1. Create a bot: talk to @BotFather on Telegram, send /newbot
+# 2. Send a message to your bot, then get your chat ID:
+#    https://api.telegram.org/bot<TOKEN>/getUpdates
+
+# 3. Configure
+knock init --provider telegram --token <BOT_TOKEN> --chat-id <CHAT_ID>
+
+# 4. Verify
+knock doctor
+knock test
+
+# 5. Watch an agent
+knock watch -- claude
+```
+
+> **Note:** If Telegram API is blocked in your region, set a proxy: `export https_proxy=http://127.0.0.1:7890`
+
+### Both local + Telegram
+
+```bash
+# Set up both providers
+knock init --provider local
+knock provider add telegram --token <BOT_TOKEN> --chat-id <CHAT_ID>
+
+# Watch with both — local notification on screen + Telegram on phone
+knock watch --provider local,telegram -- claude
+```
+
+### Make it the default
+
+Add an alias so every `claude` invocation is automatically monitored:
+
+```bash
+# Local only
+echo 'alias claude="knock watch -- claude"' >> ~/.zshrc
+
+# Or both local + Telegram
+echo 'alias claude="knock watch --provider local,telegram -- claude"' >> ~/.zshrc
+
+source ~/.zshrc
 ```
 
 ## Integration Patterns
@@ -100,6 +169,7 @@ Create config file with optional provider setup.
 
 ```bash
 knock init
+knock init --provider local
 knock init --provider telegram --token <token> --chat-id <id>
 knock init --provider bark --key <device-key>
 knock init --provider webhook --url <url>
@@ -110,10 +180,11 @@ knock init --provider webhook --url <url>
 Manage notification providers.
 
 ```bash
+knock provider add local [--sound default]
 knock provider add telegram --token <token> --chat-id <id>
 knock provider add bark --key <device-key> [--server https://api.day.app]
 knock provider add webhook --url <url> [--method POST] [--auth-header Authorization] [--auth-value 'Bearer ...']
-knock provider use <telegram|bark|webhook>
+knock provider use <local|telegram|bark|webhook>
 knock provider list
 ```
 
@@ -124,7 +195,7 @@ Send a one-off notification.
 ```bash
 knock send "deployment complete"
 knock send --title "CI" --severity high "build failed"
-knock send --provider bark "quick ping"
+knock send --provider local,telegram "notify both channels"
 ```
 
 ### `knock test`
@@ -134,6 +205,7 @@ Send a test notification to verify provider connectivity.
 ```bash
 knock test
 knock test --provider telegram
+knock test --provider local,telegram
 ```
 
 ### `knock listen`
@@ -163,7 +235,7 @@ Core feature. Monitor a subprocess and notify based on regex rules.
 ```bash
 knock watch -- claude
 knock watch --profile codex -- codex
-knock watch --provider telegram --debug -- claude
+knock watch --provider local,telegram --debug -- claude
 ```
 
 ### `knock profile`
@@ -217,3 +289,7 @@ Config is stored at:
 go build -o knock .           # local build
 ./scripts/build.sh             # cross-platform (darwin/linux × amd64/arm64)
 ```
+
+## License
+
+[MIT](LICENSE)
