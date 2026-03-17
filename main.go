@@ -51,6 +51,7 @@ type ProviderCollection struct {
 	Telegram TelegramProvider `json:"telegram"`
 	Bark     BarkProvider     `json:"bark"`
 	Webhook  WebhookProvider  `json:"webhook"`
+	Local    LocalProvider    `json:"local"`
 }
 
 type TelegramProvider struct {
@@ -72,6 +73,11 @@ type WebhookProvider struct {
 	AuthHeader   string `json:"auth_header"`
 	AuthValue    string `json:"auth_value"`
 	TimeoutMilli int    `json:"timeout_milli"`
+}
+
+type LocalProvider struct {
+	Enabled bool   `json:"enabled"`
+	Sound   string `json:"sound,omitempty"`
 }
 
 type Profile struct {
@@ -155,11 +161,12 @@ func printUsage() {
 	fmt.Printf(`knock - agent notification CLI
 
 Usage:
-  knock init [--provider telegram|bark|webhook] [provider options]
+  knock init [--provider telegram|bark|webhook|local] [provider options]
   knock provider add telegram --token <token> --chat-id <id>
   knock provider add bark --key <device-key> [--server https://api.day.app]
   knock provider add webhook --url <url> [--method POST] [--auth-header Authorization] [--auth-value 'Bearer ...']
-  knock provider use <telegram|bark|webhook>
+  knock provider add local [--sound default]
+  knock provider use <telegram|bark|webhook|local>
   knock provider list
   knock send [--provider <name>] [--title <title>] [--severity info|high] <message>
   knock test [--provider <name>]
@@ -268,6 +275,13 @@ func cmdProvider(args []string) error {
 				AuthValue:    strings.TrimSpace(*authValue),
 				TimeoutMilli: *timeout,
 			}
+		case "local":
+			fs := flag.NewFlagSet("provider add local", flag.ContinueOnError)
+			sound := fs.String("sound", "default", "notification sound name")
+			if err := fs.Parse(args[2:]); err != nil {
+				return err
+			}
+			cfg.Providers.Local = LocalProvider{Enabled: true, Sound: *sound}
 		default:
 			return fmt.Errorf("unsupported provider: %s", providerName)
 		}
@@ -319,6 +333,11 @@ func cmdProvider(args []string) error {
 		fmt.Printf("%s telegram (%s)\n", defaultMarker("telegram"), telegramStatus)
 		fmt.Printf("%s bark (%s)\n", defaultMarker("bark"), barkStatus)
 		fmt.Printf("%s webhook (%s)\n", defaultMarker("webhook"), webhookStatus)
+		localStatus := "disabled"
+		if cfg.Providers.Local.Enabled {
+			localStatus = "enabled"
+		}
+		fmt.Printf("%s local (%s)\n", defaultMarker("local"), localStatus)
 		return nil
 	default:
 		return errors.New("usage: knock provider <add|use|list> ...")
@@ -958,6 +977,11 @@ func cmdDoctor(args []string) error {
 	} else {
 		fmt.Println("- webhook: disabled")
 	}
+	if cfg.Providers.Local.Enabled {
+		fmt.Println("- local: enabled")
+	} else {
+		fmt.Println("- local: disabled")
+	}
 
 	if cfg.DefaultProvider != "" {
 		if err := validateProvider(cfg, cfg.DefaultProvider); err != nil {
@@ -1008,6 +1032,9 @@ func configureProviderFromFlags(cfg *Config, provider, token, chatID, barkServer
 			TimeoutMilli: 8000,
 		}
 		cfg.DefaultProvider = "webhook"
+	case "local":
+		cfg.Providers.Local = LocalProvider{Enabled: true, Sound: "default"}
+		cfg.DefaultProvider = "local"
 	default:
 		return fmt.Errorf("unsupported provider: %s", provider)
 	}
@@ -1109,6 +1136,8 @@ func sendNotification(cfg Config, provider string, n notification) error {
 		return sendBark(cfg.Providers.Bark, n)
 	case "webhook":
 		return sendWebhook(cfg.Providers.Webhook, n)
+	case "local":
+		return sendLocal(cfg.Providers.Local, n)
 	default:
 		return fmt.Errorf("unsupported provider: %s", provider)
 	}
@@ -1132,6 +1161,12 @@ func validateProvider(cfg Config, provider string) error {
 		p := cfg.Providers.Webhook
 		if !p.Enabled || strings.TrimSpace(p.URL) == "" {
 			return errors.New("webhook provider is not fully configured")
+		}
+		return nil
+	case "local":
+		p := cfg.Providers.Local
+		if !p.Enabled {
+			return errors.New("local provider is not enabled")
 		}
 		return nil
 	default:
@@ -1340,6 +1375,32 @@ func sendWebhook(p WebhookProvider, n notification) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
 		return fmt.Errorf("webhook status=%d body=%q", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func sendLocal(p LocalProvider, n notification) error {
+	title := n.Title
+	if title == "" {
+		title = "knock"
+	}
+	body := n.Body
+	sound := p.Sound
+	if sound == "" {
+		sound = "default"
+	}
+
+	// Use osascript with JavaScript (JXA) — more reliable than AppleScript
+	// which can break due to third-party ScriptingAdditions.
+	jxa := fmt.Sprintf(`
+var app = Application.currentApplication();
+app.includeStandardAdditions = true;
+app.displayNotification(%q, {withTitle: %q, soundName: %q});
+`, body, title, sound)
+	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", jxa)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("local notification failed: %w (%s)", err, string(output))
 	}
 	return nil
 }
