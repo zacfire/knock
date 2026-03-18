@@ -95,19 +95,15 @@ knock provider add telegram --token <BOT_TOKEN> --chat-id <CHAT_ID>
 knock watch --provider local,telegram -- claude
 ```
 
-### Make it the default
-
-Add an alias so every `claude` invocation is automatically monitored:
+### Make it the default for non-interactive CLIs
 
 ```bash
-# Local only
-echo 'alias claude="knock watch -- claude"' >> ~/.zshrc
-
-# Or both local + Telegram
-echo 'alias claude="knock watch --provider local,telegram -- claude"' >> ~/.zshrc
-
+# Alias for tools that output plain text (not TUI)
+echo 'alias codex="knock watch --profile codex -- codex"' >> ~/.zshrc
 source ~/.zshrc
 ```
+
+> **Note:** `knock watch` pipes stdin/stdout, which breaks interactive TUI tools like Claude Code. For Claude Code, use the hooks integration below instead.
 
 ## Integration Patterns
 
@@ -128,7 +124,7 @@ cat > ~/.claude/hooks/record-start.sh << 'EOF'
 date +%s > /tmp/knock-prompt-start
 EOF
 
-# Notify only if Claude took >60 seconds
+# Notify only if Claude took >60 seconds (with project name + summary)
 cat > ~/.claude/hooks/notify-if-long.sh << 'EOF'
 #!/bin/bash
 THRESHOLD=60
@@ -143,7 +139,21 @@ now=$(date +%s)
 elapsed=$((now - start))
 
 if [ "$elapsed" -ge "$THRESHOLD" ]; then
-  knock send --provider local "Claude done (${elapsed}s)"
+  # Read hook context from stdin (JSON with cwd, last_assistant_message)
+  input=$(cat)
+  project=$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null | xargs basename 2>/dev/null)
+  summary=$(echo "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null | head -c 100)
+
+  if [ -z "$project" ]; then
+    project="unknown"
+  fi
+
+  msg="[$project] done (${elapsed}s)"
+  if [ -n "$summary" ]; then
+    msg="$msg: $summary"
+  fi
+
+  knock send --provider local "$msg"
 fi
 
 rm -f "$START_FILE"
