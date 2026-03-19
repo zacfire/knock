@@ -130,6 +130,9 @@ cat > ~/.claude/hooks/notify-if-long.sh << 'EOF'
 THRESHOLD=60
 START_FILE=/tmp/knock-prompt-start
 
+# Read stdin immediately before it closes
+input=$(cat)
+
 if [ ! -f "$START_FILE" ]; then
   exit 0
 fi
@@ -139,10 +142,9 @@ now=$(date +%s)
 elapsed=$((now - start))
 
 if [ "$elapsed" -ge "$THRESHOLD" ]; then
-  # Read hook context from stdin (JSON with cwd, last_assistant_message)
-  input=$(cat)
-  project=$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null | xargs basename 2>/dev/null)
-  summary=$(echo "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null | head -c 100)
+  project=$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null)
+  project=$(basename "$project" 2>/dev/null)
+  summary=$(echo "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null | tr '\n' ' ' | cut -c1-100)
 
   if [ -z "$project" ]; then
     project="unknown"
@@ -157,6 +159,7 @@ if [ "$elapsed" -ge "$THRESHOLD" ]; then
 fi
 
 rm -f "$START_FILE"
+exit 0
 EOF
 
 chmod +x ~/.claude/hooks/record-start.sh ~/.claude/hooks/notify-if-long.sh
