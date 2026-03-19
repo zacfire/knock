@@ -1449,11 +1449,11 @@ app.displayNotification(%q, {withTitle: %q, soundName: %q});
 }
 
 func formatMessage(n notification) string {
-	severity := strings.ToUpper(strings.TrimSpace(n.Severity))
-	if severity == "" {
-		severity = "INFO"
+	severity := strings.ToLower(strings.TrimSpace(n.Severity))
+	if severity == "high" {
+		return fmt.Sprintf("[HIGH] %s", n.Body)
 	}
-	return fmt.Sprintf("[%s] %s", severity, n.Body)
+	return n.Body
 }
 
 func configPath() (string, error) {
