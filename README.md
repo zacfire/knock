@@ -98,8 +98,8 @@ knock watch --provider local,telegram -- claude
 ### Make it the default for non-interactive CLIs
 
 ```bash
-# Alias for tools that output plain text (not TUI)
-echo 'alias codex="knock watch --profile codex -- codex"' >> ~/.zshrc
+# Alias for Codex exec/non-interactive runs
+echo 'alias codex-notify="knock watch --profile codex --provider local,telegram -- codex exec"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -197,6 +197,61 @@ chmod +x ~/.claude/hooks/record-start.sh ~/.claude/hooks/notify-if-long.sh
 Now every time Claude takes more than 60 seconds to respond, you get a macOS notification automatically. Adjust `THRESHOLD` in the script to change the delay.
 
 > **Tip:** For Telegram notifications in hooks, replace `--provider local` with `--provider local,telegram`. Make sure `https_proxy` is set if Telegram is blocked in your region.
+
+### Codex hooks (recommended)
+
+Codex supports hooks for interactive sessions. This is more reliable than watching stdout because the Codex TUI does not always print a stable `done` / `complete` line when a turn finishes.
+
+1. Make the bundled hook scripts executable:
+
+```bash
+chmod +x scripts/codex-record-start-hook.sh scripts/codex-stop-hook.sh
+```
+
+2. Add hooks to `~/.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "sh /absolute/path/to/knock/scripts/codex-record-start-hook.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "sh /absolute/path/to/knock/scripts/codex-stop-hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+3. Enable hooks in `~/.codex/config.toml`:
+
+```toml
+[features]
+codex_hooks = true
+```
+
+By default the script sends to `local,telegram`. Override it with:
+
+```bash
+export KNOCK_PROVIDER=telegram
+export KNOCK_CODEX_MIN_SECONDS=60
+```
+
+`KNOCK_CODEX_MIN_SECONDS` works like the Claude example: set it to `60` if you only want notifications for longer Codex turns.
 
 ### Claude Code hooks (simple)
 
@@ -321,9 +376,11 @@ Core feature. Monitor a subprocess and notify based on regex rules.
 
 ```bash
 knock watch -- claude
-knock watch --profile codex -- codex
+knock watch --profile codex -- codex exec "explain this repository"
 knock watch --provider local,telegram --debug -- claude
 ```
+
+The `codex` profile sends a completion notification when the watched Codex process exits, even if no output line matches the completion regex. Use `--notify-exit` to enable the same exit-based notification for other profiles, and `--notify-exit-min <sec>` to suppress short runs.
 
 ### `knock profile`
 

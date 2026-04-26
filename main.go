@@ -178,10 +178,10 @@ Usage:
   knock rule remove --name <rule-name> [--profile <name>]
   knock update check [--quiet]
   knock listen [--port 9090] [--provider <name>] [--token <bearer-token>]
-  knock watch [--profile <name>] [--provider <name>[,<name>]] [--debug] -- <agent command>
+  knock watch [--profile <name>] [--provider <name>[,<name>]] [--notify-exit] [--notify-exit-min <sec>] [--debug] -- <agent command>
   knock doctor
   knock version
-`) 
+`)
 }
 
 func cmdInit(args []string) error {
@@ -778,6 +778,8 @@ func cmdWatch(args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	providerOverride := fs.String("provider", "", "provider override")
 	profileOverride := fs.String("profile", "", "profile override")
+	notifyExitFlag := fs.Bool("notify-exit", false, "notify when the watched command exits")
+	notifyExitMin := fs.Int("notify-exit-min", 0, "minimum runtime in seconds before sending an exit notification")
 	debug := fs.Bool("debug", false, "print matcher internals")
 	if err := fs.Parse(watchArgs); err != nil {
 		return err
@@ -804,6 +806,8 @@ func cmdWatch(args []string) error {
 	if !ok {
 		return fmt.Errorf("profile not found: %s", profileName)
 	}
+	notifyOnExit := *notifyExitFlag || strings.EqualFold(profileName, "codex")
+	minExitRuntime := time.Duration(maxInt(*notifyExitMin, 0)) * time.Second
 
 	rules, err := compileRules(profile.Rules)
 	if err != nil {
@@ -813,6 +817,7 @@ func cmdWatch(args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	startedAt := time.Now()
 	child := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	stdoutPipe, err := child.StdoutPipe()
 	if err != nil {
@@ -889,6 +894,7 @@ func cmdWatch(args []string) error {
 	lastInput := time.Now()
 	cooldownUntil := map[string]time.Time{}
 	var pending *pendingAlert
+	completionNotified := false
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -927,6 +933,9 @@ func cmdWatch(args []string) error {
 					if err := watchNotify(notification{Title: "knock", Body: msg, Severity: r.Severity}); err != nil {
 						fmt.Fprintf(os.Stderr, "[knock] notify failed: %v\n", err)
 					} else {
+						if isCompletionRule(r.Rule) {
+							completionNotified = true
+						}
 						cooldownUntil[r.Name] = now.Add(time.Duration(r.CooldownSeconds) * time.Second)
 					}
 					continue
@@ -953,6 +962,9 @@ func cmdWatch(args []string) error {
 			if err := watchNotify(notification{Title: "knock", Body: msg, Severity: pending.Rule.Severity}); err != nil {
 				fmt.Fprintf(os.Stderr, "[knock] notify failed: %v\n", err)
 			} else {
+				if isCompletionRule(pending.Rule) {
+					completionNotified = true
+				}
 				cooldownUntil[pending.Rule.Name] = now.Add(time.Duration(pending.Rule.CooldownSeconds) * time.Second)
 			}
 			pending = nil
@@ -965,12 +977,56 @@ func cmdWatch(args []string) error {
 				_ = child.Process.Signal(sig)
 			}
 		case err := <-waitCh:
+			if notifyOnExit && !completionNotified && time.Since(startedAt) >= minExitRuntime {
+				severity := "info"
+				event := "Task completed"
+				if err != nil {
+					severity = "high"
+					event = "Command exited with error"
+				}
+				msg := fmt.Sprintf("%s: %q finished after %s", event, strings.Join(cmdArgs, " "), shortDuration(time.Since(startedAt)))
+				if err != nil {
+					msg = fmt.Sprintf("%s (%v)", msg, err)
+				}
+				if notifyErr := watchNotify(notification{Title: "knock", Body: msg, Severity: severity}); notifyErr != nil {
+					fmt.Fprintf(os.Stderr, "[knock] notify failed: %v\n", notifyErr)
+				}
+			}
 			if err == nil {
 				return nil
 			}
 			return err
 		}
 	}
+}
+
+func isCompletionRule(r Rule) bool {
+	name := strings.ToLower(strings.TrimSpace(r.Name))
+	event := strings.ToLower(strings.TrimSpace(r.Event))
+	return strings.Contains(name, "complete") || strings.Contains(event, "complete") || strings.Contains(event, "finished")
+}
+
+func shortDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d < time.Second {
+		return "0s"
+	}
+	if d < time.Minute {
+		return d.String()
+	}
+	min := int(d / time.Minute)
+	sec := int((d % time.Minute) / time.Second)
+	if sec == 0 {
+		return fmt.Sprintf("%dm", min)
+	}
+	return fmt.Sprintf("%dm%ds", min, sec)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func cmdDoctor(args []string) error {
@@ -1232,10 +1288,14 @@ type telegramUpdate struct {
 }
 
 type telegramCallbackQuery struct {
-	ID      string `json:"id"`
-	From    struct{ ID int `json:"id"` } `json:"from"`
+	ID   string `json:"id"`
+	From struct {
+		ID int `json:"id"`
+	} `json:"from"`
 	Message struct {
-		Chat struct{ ID int64 `json:"id"` } `json:"chat"`
+		Chat struct {
+			ID int64 `json:"id"`
+		} `json:"chat"`
 	} `json:"message"`
 	Data string `json:"data"`
 }
