@@ -4,9 +4,16 @@ dist/
 
 # Local config and env
 .env
+.env.*
+!.env.example
+config.json
+*.local
 
 # macOS
 .DS_Store
 
 # Claude Code
 .claude/
+
+# Codex local settings
+.codex/

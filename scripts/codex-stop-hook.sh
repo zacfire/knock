@@ -2,7 +2,7 @@
 set -eu
 
 input=$(cat)
-provider=${KNOCK_PROVIDER:-local,telegram}
+provider=${KNOCK_PROVIDER:-local}
 threshold=${KNOCK_CODEX_MIN_SECONDS:-0}
 start_file=${KNOCK_CODEX_START_FILE:-/tmp/knock-codex-prompt-start}
 

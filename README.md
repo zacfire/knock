@@ -227,7 +227,7 @@ chmod +x scripts/codex-record-start-hook.sh scripts/codex-stop-hook.sh
       {
         "hooks": [
           {
-            "command": "sh /absolute/path/to/knock/scripts/codex-stop-hook.sh",
+            "command": "KNOCK_PROVIDER=local,telegram sh /absolute/path/to/knock/scripts/codex-stop-hook.sh",
             "timeout": 10
           }
         ]
@@ -244,7 +244,22 @@ chmod +x scripts/codex-record-start-hook.sh scripts/codex-stop-hook.sh
 codex_hooks = true
 ```
 
-By default the script sends to `local,telegram`. Override it with:
+By default the script sends to `local`. Use `KNOCK_PROVIDER` to choose one or more providers:
+
+```bash
+export KNOCK_PROVIDER=local,telegram
+```
+
+If Telegram needs a proxy in your region, add proxy variables to the hook command:
+
+```json
+{
+  "command": "KNOCK_PROVIDER=local,telegram https_proxy=http://127.0.0.1:7890 sh /absolute/path/to/knock/scripts/codex-stop-hook.sh",
+  "timeout": 10
+}
+```
+
+You can also suppress short turns:
 
 ```bash
 export KNOCK_PROVIDER=telegram
@@ -426,6 +441,18 @@ Config is stored at:
 - **macOS:** `~/Library/Application Support/knock/config.json`
 - **Linux:** `~/.config/knock/config.json`
 - **Override:** `KNOCK_CONFIG_PATH` environment variable
+
+## Open Source Safety
+
+Do not commit your real notification config or agent hook files. Keep these local:
+
+- `~/Library/Application Support/knock/config.json`
+- `~/.config/knock/config.json`
+- `~/.claude/`
+- `~/.codex/`
+- `.env`
+
+Rotate your Telegram bot token, Bark key, or webhook secret if it is accidentally pasted into logs, screenshots, issues, or commits.
 
 ## Build
 
