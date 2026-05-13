@@ -139,6 +139,8 @@ func main() {
 		err = cmdListen(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
+	case "codex-app-watch":
+		err = cmdCodexAppWatch(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "version", "--version", "-v":
@@ -179,6 +181,7 @@ Usage:
   knock update check [--quiet]
   knock listen [--port 9090] [--provider <name>] [--token <bearer-token>]
   knock watch [--profile <name>] [--provider <name>[,<name>]] [--notify-exit] [--notify-exit-min <sec>] [--debug] -- <agent command>
+  knock codex-app-watch [--provider <name>[,<name>]] [--codex-home <path>] [--interval <sec>] [--replay] [--debug]
   knock doctor
   knock version
 `)
@@ -1027,6 +1030,278 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func cmdCodexAppWatch(args []string) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	defaultCodexHome := filepath.Join(os.Getenv("HOME"), ".codex")
+	fs := flag.NewFlagSet("codex-app-watch", flag.ContinueOnError)
+	providerOverride := fs.String("provider", "", "provider override")
+	codexHome := fs.String("codex-home", defaultCodexHome, "Codex home directory")
+	intervalSec := fs.Int("interval", 2, "poll interval in seconds")
+	replay := fs.Bool("replay", false, "notify for existing task_complete events on startup")
+	debug := fs.Bool("debug", false, "print watcher internals")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	targetProvider := strings.TrimSpace(*providerOverride)
+	if targetProvider == "" {
+		targetProvider = cfg.DefaultProvider
+	}
+	if targetProvider == "" {
+		return errors.New("no provider configured")
+	}
+
+	interval := time.Duration(maxInt(*intervalSec, 1)) * time.Second
+	offsets := map[string]int64{}
+	notified := map[string]bool{}
+	metaCache := map[string]codexSessionMeta{}
+	startedAt := time.Now()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("watching Codex App logs in %s provider=%s interval=%s\n", *codexHome, targetProvider, interval)
+	for {
+		if err := scanCodexAppLogs(cfg, *codexHome, targetProvider, offsets, notified, metaCache, startedAt, *replay, *debug); err != nil {
+			fmt.Fprintf(os.Stderr, "[knock] codex app watch: %v\n", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(interval):
+		}
+	}
+}
+
+type codexSessionMeta struct {
+	ID  string
+	CWD string
+}
+
+func scanCodexAppLogs(cfg Config, codexHome, provider string, offsets map[string]int64, notified map[string]bool, metaCache map[string]codexSessionMeta, startedAt time.Time, replay bool, debug bool) error {
+	files, err := codexLogFiles(codexHome, startedAt)
+	if err != nil {
+		return err
+	}
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		offset, seen := offsets[path]
+		if !seen {
+			if !replay && info.ModTime().Before(startedAt) {
+				offsets[path] = info.Size()
+				continue
+			}
+			offset = 0
+		}
+		if info.Size() < offset {
+			offset = 0
+		}
+		if info.Size() == offset {
+			continue
+		}
+		next, err := processCodexLogFile(cfg, provider, path, offset, notified, metaCache, startedAt, replay, debug)
+		if err != nil {
+			if debug {
+				fmt.Fprintf(os.Stderr, "[knock-debug] %s: %v\n", path, err)
+			}
+			continue
+		}
+		offsets[path] = next
+	}
+	return nil
+}
+
+func codexLogFiles(codexHome string, now time.Time) ([]string, error) {
+	var files []string
+	roots := []string{filepath.Join(codexHome, "archived_sessions")}
+	for daysBack := 0; daysBack < 3; daysBack++ {
+		t := now.AddDate(0, 0, -daysBack)
+		roots = append(roots, filepath.Join(
+			codexHome,
+			"sessions",
+			t.Format("2006"),
+			t.Format("01"),
+			t.Format("02"),
+		))
+	}
+	for _, root := range roots {
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(path, ".jsonl") {
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func processCodexLogFile(cfg Config, provider, path string, offset int64, notified map[string]bool, metaCache map[string]codexSessionMeta, startedAt time.Time, replay bool, debug bool) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return offset, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return offset, err
+	}
+
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 4*1024*1024)
+	currentOffset := offset
+	for scanner.Scan() {
+		line := scanner.Text()
+		currentOffset += int64(len(scanner.Bytes())) + 1
+		event, ok := parseCodexTaskComplete(line)
+		if !ok {
+			continue
+		}
+		if !replay && !codexEventAtOrAfter(event.Timestamp, startedAt) {
+			continue
+		}
+		key := event.TurnID
+		if key == "" {
+			key = fmt.Sprintf("%s:%s:%s", path, event.Timestamp, event.LastAgentMessage)
+		}
+		if notified[key] {
+			continue
+		}
+		meta := metaCache[path]
+		if meta.ID == "" && meta.CWD == "" {
+			meta = readCodexSessionMeta(path)
+			metaCache[path] = meta
+		}
+		n := codexTaskNotification(meta, event)
+		if err := sendNotification(cfg, provider, n); err != nil {
+			return currentOffset, err
+		}
+		notified[key] = true
+		if debug {
+			fmt.Printf("[knock-debug] notified codex task_complete turn=%s file=%s\n", event.TurnID, path)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return currentOffset, err
+	}
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return currentOffset, nil
+	}
+	return pos, nil
+}
+
+type codexTaskCompleteEvent struct {
+	Timestamp        string
+	TurnID           string
+	LastAgentMessage string
+	DurationMS       int64
+}
+
+func parseCodexTaskComplete(line string) (codexTaskCompleteEvent, bool) {
+	var raw struct {
+		Timestamp string `json:"timestamp"`
+		Type      string `json:"type"`
+		Payload   struct {
+			Type             string `json:"type"`
+			TurnID           string `json:"turn_id"`
+			LastAgentMessage string `json:"last_agent_message"`
+			DurationMS       int64  `json:"duration_ms"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+		return codexTaskCompleteEvent{}, false
+	}
+	if raw.Type != "event_msg" || raw.Payload.Type != "task_complete" {
+		return codexTaskCompleteEvent{}, false
+	}
+	return codexTaskCompleteEvent{
+		Timestamp:        raw.Timestamp,
+		TurnID:           raw.Payload.TurnID,
+		LastAgentMessage: raw.Payload.LastAgentMessage,
+		DurationMS:       raw.Payload.DurationMS,
+	}, true
+}
+
+func codexEventAtOrAfter(timestamp string, cutoff time.Time) bool {
+	t, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return true
+	}
+	return !t.Before(cutoff.Add(-2 * time.Second))
+}
+
+func readCodexSessionMeta(path string) codexSessionMeta {
+	f, err := os.Open(path)
+	if err != nil {
+		return codexSessionMeta{}
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	if !scanner.Scan() {
+		return codexSessionMeta{}
+	}
+	var raw struct {
+		Type    string `json:"type"`
+		Payload struct {
+			ID  string `json:"id"`
+			CWD string `json:"cwd"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+		return codexSessionMeta{}
+	}
+	if raw.Type != "session_meta" {
+		return codexSessionMeta{}
+	}
+	return codexSessionMeta{ID: raw.Payload.ID, CWD: raw.Payload.CWD}
+}
+
+func codexTaskNotification(meta codexSessionMeta, event codexTaskCompleteEvent) notification {
+	project := "Codex App"
+	if strings.TrimSpace(meta.CWD) != "" {
+		project = filepath.Base(meta.CWD)
+	}
+	duration := ""
+	if event.DurationMS > 0 {
+		duration = fmt.Sprintf(" in %s", shortDuration(time.Duration(event.DurationMS)*time.Millisecond))
+	}
+	summary := truncateSingleLine(event.LastAgentMessage, 180)
+	body := fmt.Sprintf("[%s] task complete%s", project, duration)
+	if summary != "" {
+		body = fmt.Sprintf("%s: %s", body, summary)
+	}
+	return notification{Title: "Codex App", Body: body, Severity: "info"}
+}
+
+func truncateSingleLine(s string, limit int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= limit {
+		return s
+	}
+	if limit <= 3 {
+		return s[:limit]
+	}
+	return s[:limit-3] + "..."
 }
 
 func cmdDoctor(args []string) error {

@@ -268,6 +268,16 @@ export KNOCK_CODEX_MIN_SECONDS=60
 
 `KNOCK_CODEX_MIN_SECONDS` works like the Claude example: set it to `60` if you only want notifications for longer Codex turns.
 
+### Codex Desktop App monitor
+
+Codex Desktop App sessions write `task_complete` events to local JSONL files under `~/.codex`. If hooks do not fire for the desktop app, run a local monitor:
+
+```bash
+knock codex-app-watch --provider local,telegram
+```
+
+This command watches `~/.codex/sessions` and `~/.codex/archived_sessions`, skips existing events on startup, and notifies only for newly completed Codex App turns. Keep it running in a terminal, or run it under `launchd`/systemd.
+
 ### Claude Code hooks (simple)
 
 For simpler use cases like monitoring specific tool usage:
